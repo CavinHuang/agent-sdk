@@ -3,7 +3,10 @@
  * Must be imported before any other module.
  */
 
+import { createRequire } from 'module'
+
 const _global = globalThis as any
+const _require = createRequire(import.meta.url)
 
 if (!_global.MACRO) {
   _global.MACRO = {
@@ -20,10 +23,25 @@ if (!_global.Gates) {
 }
 
 if (typeof _global.Bun === 'undefined') {
+  // Lazy-load npm semver for the Bun.semver polyfill
+  let _npmSemver: typeof import('semver') | undefined
+  function requireSemver(): typeof import('semver') {
+    if (!_npmSemver) {
+      _npmSemver = _require('semver') as typeof import('semver')
+    }
+    return _npmSemver
+  }
+
   _global.Bun = {
     env: process.env,
     version: '0.0.0',
     sleep: (ms: number) => new Promise(r => setTimeout(r, ms)),
+    semver: {
+      satisfies: (version: string, range: string) =>
+        requireSemver().satisfies(version, range, { loose: true }),
+      order: (a: string, b: string) =>
+        requireSemver().compare(a, b, { loose: true }),
+    },
   }
 }
 

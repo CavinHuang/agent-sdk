@@ -354,6 +354,12 @@ export class Agent {
 
     if (this.options.apiKey) {
       process.env.ANTHROPIC_API_KEY = this.options.apiKey
+      // Clear ANTHROPIC_AUTH_TOKEN to prevent it from overriding x-api-key
+      // authentication when a third-party API endpoint is used.
+      // The internal configureApiKeyHeaders() prefers ANTHROPIC_AUTH_TOKEN
+      // over ANTHROPIC_API_KEY, which causes 401 errors with providers
+      // that don't recognize the token.
+      delete process.env.ANTHROPIC_AUTH_TOKEN
     }
     if (this.options.baseURL) {
       process.env.ANTHROPIC_BASE_URL = this.options.baseURL

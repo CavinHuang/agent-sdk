@@ -36,6 +36,7 @@
     "build:cli": "node build.mjs",
     "dev": "bun run src/entrypoints/cli.tsx",
     "dev:watch": "tsc --watch",
+    "web": "bun run examples/web/server.ts",
     "test": "node --experimental-vm-modules node_modules/.bin/vitest run",
     "lint": "tsc --noEmit",
     "postinstall": "node scripts/create-shims.mjs",
@@ -45,6 +46,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@alcalzone/ansi-tokenize": "^0.3.0",
     "@alcalzone/jsonl-db": "^4.0.2",
     "@anthropic-ai/sdk": "^0.52.0",
     "@commander-js/extra-typings": "^12.1.0",
@@ -126,6 +128,7 @@
     "@types/semver": "^7.5.0",
     "@types/shell-quote": "^1.7.5",
     "@types/ws": "^8.5.0",
+    "dotenv": "^17.4.0",
     "esbuild": "^0.27.4",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

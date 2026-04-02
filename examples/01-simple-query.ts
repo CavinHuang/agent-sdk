@@ -7,6 +7,22 @@
  * Run: npx tsx examples/01-simple-query.ts
  */
 import { createAgent } from '@shipany/open-agent-sdk'
+import { query as queryAgent } from '@shipany/open-agent-sdk'
+import { query as queryOfficial } from '@anthropic-ai/claude-agent-sdk'
+
+queryOfficial({
+  prompt: 'add',
+  options: {
+    includePartialMessages: true,
+  }
+})
+
+queryAgent({
+  prompt: 'add',
+  options: {
+    includePartialMessages: true,
+  }
+})
 
 async function main() {
   console.log('--- Example 1: Simple Query ---\n')
