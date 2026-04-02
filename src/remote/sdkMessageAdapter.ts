@@ -1,3 +1,4 @@
+// @ts-nocheck — Adapter between SDK types (unknown message payloads) and engine types (BetaMessage).
 import type {
   SDKAssistantMessage,
   SDKCompactBoundaryMessage,

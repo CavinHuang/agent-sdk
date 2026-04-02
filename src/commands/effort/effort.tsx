@@ -120,7 +120,7 @@ function ShowCurrentEffort(t0) {
   const {
     onDone
   } = t0;
-  const effortValue = useAppState(_temp);
+  const effortValue = useAppState(_temp) as EffortValue | undefined;
   const model = useMainLoopModel();
   const {
     message
@@ -128,7 +128,7 @@ function ShowCurrentEffort(t0) {
   onDone(message);
   return null;
 }
-function _temp(s) {
+function _temp(s: any) {
   return s.effortValue;
 }
 function ApplyEffortAndClose(t0) {

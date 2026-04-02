@@ -60,5 +60,16 @@ export { getHistory, addToHistory } from './history.js'
 // High-level Agent API
 // ============================================================================
 
-export { Agent, createAgent, query } from './agent.js'
-export type { AgentOptions, QueryResult } from './agent.js'
+// High-level Agent API (Open Agent SDK exclusive — not in official SDK)
+// Note: `query` is NOT re-exported from agent.js to avoid conflict with
+// the official SDK-compatible `query` from agentSdkTypes.ts (via export *).
+export { Agent, createAgent } from './agent.js'
+export type {
+  AgentOptions,
+  QueryResult,
+  SDKHookCallback,
+  SDKHookMatcher,
+  SDKAgentDefinition,
+  SDKCanUseTool,
+  SDKPermissionResult,
+} from './agent.js'

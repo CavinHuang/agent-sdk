@@ -97,4 +97,13 @@ export type SDKPartialAssistantMessage = {
 
 // Additional control types needed by consumers
 export type SDKControlInitializeRequest = any;
-export type SDKControlInitializeResponse = any;
+
+export type SDKControlInitializeResponse = {
+  commands: import('./coreTypes.generated.js').SlashCommand[]
+  agents: import('./coreTypes.generated.js').AgentInfo[]
+  output_style: string
+  available_output_styles: string[]
+  models: import('./coreTypes.generated.js').ModelInfo[]
+  account: import('./coreTypes.generated.js').AccountInfo
+  fast_mode_state?: import('./coreTypes.generated.js').FastModeState
+}
