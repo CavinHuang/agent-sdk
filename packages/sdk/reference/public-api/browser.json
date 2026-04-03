@@ -1,0 +1,25 @@
+{
+  "symbols": [
+    "AuthMessage",
+    "BrowserQueryOptions",
+    "CanUseTool",
+    "createSdkMcpServer",
+    "ElicitationRequest",
+    "ElicitationResult",
+    "HookCallbackMatcher",
+    "HookEvent",
+    "McpSdkServerConfigWithInstance",
+    "McpServerConfig",
+    "OAuthCredential",
+    "OnElicitation",
+    "query",
+    "Query",
+    "SDKAssistantMessage",
+    "SDKMessage",
+    "SDKResultMessage",
+    "SDKSystemMessage",
+    "SDKUserMessage",
+    "tool",
+    "WebSocketOptions"
+  ]
+}

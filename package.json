@@ -137,6 +137,9 @@
     "dist",
     "README.md"
   ],
+  "workspaces": [
+    "packages/*"
+  ],
   "license": "MIT",
   "keywords": [
     "open-agent-sdk",

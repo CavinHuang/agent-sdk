@@ -1,0 +1,26 @@
+{
+  ".": {
+    "types": "./dist/sdk.d.ts",
+    "default": "./dist/sdk.js"
+  },
+  "./embed": {
+    "types": "./dist/embed.d.ts",
+    "default": "./dist/embed.js"
+  },
+  "./browser": {
+    "types": "./dist/browser.d.ts",
+    "default": "./dist/browser.js"
+  },
+  "./bridge": {
+    "types": "./dist/bridge.d.ts",
+    "default": "./dist/bridge.js"
+  },
+  "./sdk-tools": {
+    "types": "./dist/sdk-tools.d.ts",
+    "default": "./dist/sdk-tools.js"
+  },
+  "./sdk-tools.js": {
+    "types": "./dist/sdk-tools.d.ts",
+    "default": "./dist/sdk-tools.js"
+  }
+}

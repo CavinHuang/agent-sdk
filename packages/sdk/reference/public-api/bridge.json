@@ -1,0 +1,11 @@
+{
+  "symbols": [
+    "attachBridgeSession",
+    "AttachBridgeSessionOptions",
+    "BridgeSessionHandle",
+    "createCodeSession",
+    "fetchRemoteCredentials",
+    "RemoteCredentials",
+    "SessionState"
+  ]
+}
