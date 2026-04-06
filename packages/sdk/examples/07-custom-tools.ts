@@ -5,61 +5,21 @@
  *
  * Run: npx tsx examples/07-custom-tools.ts
  */
-import { createAgent, getAllBaseTools } from '@shipany/open-agent-sdk'
+import { createAgent, getAllBaseTools, defineTool } from '../src/index.js'
 
-/**
- * Helper to create custom tools compatible with the engine.
- * Provides all required interface methods so the tool integrates
- * seamlessly with the QueryEngine tool execution pipeline.
- */
-function customTool(config: {
-  name: string
-  description: string
-  properties: Record<string, unknown>
-  required?: string[]
-  handler: (input: any) => Promise<string>
-}) {
-  const passthroughSchema = {
-    safeParse: (v: any) => ({ success: true, data: v }),
-    parse: (v: any) => v,
-  }
-
-  return {
-    name: config.name,
-    description: config.description,
-    get inputSchema() { return passthroughSchema },
-    inputJSONSchema: {
-      type: 'object' as const,
-      properties: config.properties,
-      required: config.required || [],
-    },
-    async prompt() { return config.description },
-    userFacingName: () => config.name,
-    async call(input: any) {
-      const output = await config.handler(input)
-      return { data: output }
-    },
-    isReadOnly: () => true,
-    isConcurrencySafe: () => true,
-    isEnabled: () => true,
-    renderToolUseMessage: () => null,
-    renderToolResultMessage: () => null,
-    mapToolResultToToolResultBlockParam: (data: any, id: string) => ({
-      type: 'tool_result',
-      tool_use_id: id,
-      content: typeof data === 'string' ? data : JSON.stringify(data),
-    }),
-  } as any
-}
-
-const weatherTool = customTool({
+const weatherTool = defineTool({
   name: 'GetWeather',
   description: 'Get current weather for a city. Returns temperature and conditions.',
-  properties: {
-    city: { type: 'string', description: 'City name (e.g., "Tokyo", "London")' },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      city: { type: 'string', description: 'City name (e.g., "Tokyo", "London")' },
+    },
+    required: ['city'],
   },
-  required: ['city'],
-  async handler(input) {
+  isReadOnly: true,
+  isConcurrencySafe: true,
+  async call(input) {
     const temps: Record<string, number> = {
       tokyo: 22, london: 14, beijing: 25, 'new york': 18, paris: 16,
     }
@@ -68,19 +28,24 @@ const weatherTool = customTool({
   },
 })
 
-const calculatorTool = customTool({
+const calculatorTool = defineTool({
   name: 'Calculator',
   description: 'Evaluate a mathematical expression. Use ** for exponentiation.',
-  properties: {
-    expression: { type: 'string', description: 'Math expression (e.g., "42 * 17 + 3", "2 ** 10")' },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      expression: { type: 'string', description: 'Math expression (e.g., "42 * 17 + 3", "2 ** 10")' },
+    },
+    required: ['expression'],
   },
-  required: ['expression'],
-  async handler(input) {
+  isReadOnly: true,
+  isConcurrencySafe: true,
+  async call(input) {
     try {
       const result = Function(`'use strict'; return (${input.expression})`)()
       return `${input.expression} = ${result}`
     } catch (e: any) {
-      return `Error: ${e.message}`
+      return { data: `Error: ${e.message}`, is_error: true }
     }
   },
 })
@@ -92,7 +57,7 @@ async function main() {
   const allTools = [...builtinTools, weatherTool, calculatorTool]
 
   const agent = createAgent({
-    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
     maxTurns: 10,
     tools: allTools,
   })

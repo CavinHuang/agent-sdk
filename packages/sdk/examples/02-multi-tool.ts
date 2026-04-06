@@ -6,13 +6,13 @@
  *
  * Run: npx tsx examples/02-multi-tool.ts
  */
-import { createAgent } from '@shipany/open-agent-sdk'
+import { createAgent } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 2: Multi-Tool Orchestration ---\n')
 
   const agent = createAgent({
-    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
     maxTurns: 15,
   })
 

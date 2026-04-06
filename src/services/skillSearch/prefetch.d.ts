@@ -1,0 +1,22 @@
+export declare const FAST_MODE_MODEL_DISPLAY: string;
+export declare const option: any;
+export declare function clearFastModeCooldown(..._args: any[]): void;
+export declare function getFastModeModel(..._args: any[]): any;
+export declare function getFastModeRuntimeState(..._args: any[]): any;
+export declare function getFastModeUnavailableReason(..._args: any[]): any;
+export declare function getInitialFastModeSetting(..._args: any[]): any;
+export declare function getMcpToolsCommandsAndResources(..._args: any[]): any;
+export declare function getSubscriptionType(..._args: any[]): any;
+export declare function isClaudeAISubscriber(..._args: any[]): boolean;
+export declare function isFastModeEnabled(..._args: any[]): boolean;
+export declare function isFastModeSupportedByModel(..._args: any[]): boolean;
+export declare function prefetchAllMcpResources(..._args: any[]): any;
+export declare function prefetchApiKeyFromApiKeyHelperIfSafe(..._args: any[]): any;
+export declare function prefetchAwsCredentialsAndBedRockInfoIfSafe(..._args: any[]): any;
+export declare function prefetchFastModeStatus(..._args: any[]): any;
+export declare function prefetchGcpCredentialsIfSafe(..._args: any[]): any;
+export declare function prefetchOfficialMcpUrls(..._args: any[]): any;
+export declare function prefetchPassesEligibility(..._args: any[]): any;
+export declare function resolveFastModeStatusFromCache(..._args: any[]): any;
+export declare function validateForceLoginOrg(..._args: any[]): any;
+//# sourceMappingURL=prefetch.d.ts.map

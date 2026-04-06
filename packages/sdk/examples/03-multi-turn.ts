@@ -6,13 +6,13 @@
  *
  * Run: npx tsx examples/03-multi-turn.ts
  */
-import { createAgent } from '@shipany/open-agent-sdk'
+import { createAgent } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 3: Multi-Turn Conversation ---\n')
 
   const agent = createAgent({
-    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
     maxTurns: 5,
   })
 

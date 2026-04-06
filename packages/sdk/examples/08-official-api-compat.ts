@@ -2,16 +2,16 @@
  * Example 8: Official SDK-Compatible API
  *
  * Demonstrates the query() function with the same API pattern
- * as @anthropic-ai/claude-agent-sdk. Drop-in compatible.
+ * as open-agent-sdk. Drop-in compatible.
  *
  * Run: npx tsx examples/08-official-api-compat.ts
  */
-import { query } from '@shipany/open-agent-sdk'
+import { query } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 8: Official SDK-Compatible API ---\n')
 
-  // Same pattern as the official claude-agent-sdk quickstart
+  // Standard SDK query pattern
   for await (const message of query({
     prompt: 'What files are in this directory? Be brief.',
     options: {

@@ -5,13 +5,13 @@
  *
  * Run: npx tsx examples/05-custom-system-prompt.ts
  */
-import { createAgent } from '@shipany/open-agent-sdk'
+import { createAgent } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 5: Custom System Prompt ---\n')
 
   const agent = createAgent({
-    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
     maxTurns: 5,
     systemPrompt:
       'You are a senior code reviewer. When asked to review code, focus on: ' +

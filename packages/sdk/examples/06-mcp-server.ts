@@ -10,13 +10,13 @@
  *
  * Run: npx tsx examples/06-mcp-server.ts
  */
-import { createAgent } from '@shipany/open-agent-sdk'
+import { createAgent } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 6: MCP Server Integration ---\n')
 
   const agent = createAgent({
-    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
     maxTurns: 10,
     mcpServers: {
       filesystem: {
@@ -34,6 +34,8 @@ async function main() {
 
   console.log(`Answer: ${result.text}`)
   console.log(`Turns: ${result.num_turns}`)
+
+  await agent.close()
 }
 
 main().catch(e => {

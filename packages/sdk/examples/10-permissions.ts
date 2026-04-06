@@ -6,7 +6,7 @@
  *
  * Run: npx tsx examples/10-permissions.ts
  */
-import { query } from '@shipany/open-agent-sdk'
+import { query } from '../src/index.js'
 
 async function main() {
   console.log('--- Example 10: Read-Only Agent ---\n')

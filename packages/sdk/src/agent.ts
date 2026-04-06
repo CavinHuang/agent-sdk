@@ -1,972 +1,1191 @@
-// @ts-nocheck
-
 /**
- * Open Agent SDK - High-level Agent API
+ * Agent - High-level API
  *
- * Provides a simple createAgent() interface that wraps the full
- * Claude Code engine (QueryEngine, tools, services).
- *
- * Usage:
- *   import { createAgent } from '@shipany/open-agent-sdk'
- *
- *   const agent = createAgent({
- *     model: 'claude-sonnet-4-6',
- *     apiKey: process.env.ANTHROPIC_API_KEY,
- *   })
- *
- *   // Streaming
- *   for await (const event of agent.query('Analyze this codebase')) {
- *     if (event.type === 'assistant') console.log(event)
- *   }
- *
- *   // Simple
- *   const result = await agent.prompt('What does this code do?')
- *   console.log(result.text)
+ * Provides createAgent() and query() interfaces compatible with
+ * the Claude-style Agent SDK surface while keeping the full
+ * agent loop in-process.
  */
 
-import './setup-globals.js'
-
-import { ask, type SDKMessage } from './QueryEngine.js'
-import { getAllBaseTools } from './tools.js'
-import { getCommands } from './commands.js'
-import { getDefaultAppState, type AppState } from './state/AppStateStore.js'
-import { createFileStateCacheWithSizeLimit, type FileStateCache } from './utils/fileStateCache.js'
-import type { Tool, Tools } from './Tool.js'
-import type { Message } from './types/message.js'
-import type { CanUseToolFn } from './hooks/useCanUseTool.js'
-import type { ThinkingConfig } from './utils/thinking.js'
-import type { HookEvent, HookInput, HookJSONOutput, HookCallback, HookCallbackMatcher } from './types/hooks.js'
+import type {
+  AgentOptions,
+  ContextUsageResult,
+  InitializationResult,
+  MCPServerStatus,
+  Message,
+  PermissionMode,
+  Query as QueryHandle,
+  QueryResult,
+  ReloadPluginsResult,
+  RewindFilesResult,
+  SDKMessage,
+  SDKUserMessage,
+  SessionMessage,
+  ToolDefinition,
+  CanUseToolFn,
+  McpServerConfig,
+  ContentBlockParam,
+} from './types.js'
+import { QueryEngine } from './engine.js'
 import {
-  registerHookCallbacks,
-  setSdkBetas,
-  switchSession,
-  setSessionPersistenceDisabled,
-  setAllowedSettingSources,
-  setAdditionalDirectoriesForClaudeMd,
-  setQuestionPreviewFormat,
-  setSdkAgentProgressSummariesEnabled,
-  setFlagSettingsPath,
-  setFlagSettingsInline,
-  setInlinePlugins,
-} from './bootstrap/state.js'
-import { filterAllowedSdkBetas } from './utils/betas.js'
-import { setAllHookEventsEnabled } from './utils/hooks/hookEvents.js'
-import { parseEffortValue, type EffortValue } from './utils/effort.js'
-import type { PermissionMode } from './utils/permissions/types.js'
-import type { AgentMemoryScope } from './components/agents/types.js'
+  assembleToolPool,
+  filterTools,
+  getAllBaseTools,
+} from './tools/index.js'
+import {
+  closeAllConnections,
+  connectMCPServer,
+  type MCPConnection,
+} from './mcp/client.js'
+import { isSdkServerConfig } from './sdk-mcp-server.js'
+import { registerAgents } from './tools/agent-tool.js'
+import {
+  saveSession,
+  loadSession,
+  listSessions,
+  forkSession as forkStoredSession,
+} from './session.js'
+import { createHookRegistry, type HookRegistry } from './hooks.js'
+import {
+  getUserInvocableSkills,
+  initBundledSkills,
+  registerSkill,
+  unregisterSkill,
+} from './skills/index.js'
+import { createProvider, type LLMProvider, type ApiType } from './providers/index.js'
+import type { NormalizedMessageParam } from './providers/types.js'
+import {
+  loadSettingsFromSources,
+  mergeAgentOptions,
+  loadClaudeMdFiles,
+  type LoadedSettingsSource,
+} from './utils/settings.js'
+import { QueryController } from './query-controller.js'
+import { loadPlugins, type LoadedPlugin } from './plugins/loader.js'
+import type { FileCheckpointState } from './utils/file-checkpoints.js'
+import { rewindCheckpoint } from './utils/file-checkpoints.js'
+import { getDefaultModels } from './utils/models.js'
+import { setMcpConnections } from './tools/mcp-resource-tools.js'
+import { getContextWindowSize } from './utils/tokens.js'
 
-// ============================================================================
-// Types
-// ============================================================================
+type QueryInput = string | ContentBlockParam[] | SDKUserMessage
 
-/**
- * SDK-compatible hook callback.
- * Matches official @anthropic-ai/claude-agent-sdk HookCallback signature exactly.
- */
-export type SDKHookCallback = (
-  input: HookInput,
-  toolUseID: string | undefined,
-  options: { signal: AbortSignal },
-) => Promise<HookJSONOutput>
-
-/**
- * SDK-compatible hook callback matcher.
- * Matches official @anthropic-ai/claude-agent-sdk HookCallbackMatcher interface.
- */
-export type SDKHookMatcher = {
-  matcher?: string
-  hooks: SDKHookCallback[]
-  timeout?: number
+function isAsyncIterable<T>(value: unknown): value is AsyncIterable<T> {
+  return !!value && typeof (value as AsyncIterable<T>)[Symbol.asyncIterator] === 'function'
 }
 
-/**
- * SDK-compatible permission result.
- * Matches official @anthropic-ai/claude-agent-sdk PermissionResult.
- */
-export type SDKPermissionResult = {
-  behavior: 'allow'
-  updatedInput?: Record<string, unknown>
-  updatedPermissions?: any[]
-  toolUseID?: string
-} | {
-  behavior: 'deny'
-  message: string
-  interrupt?: boolean
-  toolUseID?: string
+function toSessionMessage(
+  role: SessionMessage['role'],
+  content: unknown,
+): SessionMessage {
+  return {
+    uuid: crypto.randomUUID(),
+    role,
+    timestamp: new Date().toISOString(),
+    content,
+  }
 }
 
-/**
- * SDK-compatible canUseTool callback.
- * Matches official @anthropic-ai/claude-agent-sdk CanUseTool signature exactly:
- *   (toolName, input, options) => Promise<PermissionResult>
- *
- * options includes: signal, suggestions?, blockedPath?, decisionReason?,
- *   title?, displayName?, description?, toolUseID, agentID?
- */
-export type SDKCanUseTool = (
-  toolName: string,
-  input: Record<string, unknown>,
-  options: {
-    signal: AbortSignal
-    suggestions?: any[]
-    blockedPath?: string
-    decisionReason?: string
-    title?: string
-    displayName?: string
-    description?: string
-    toolUseID: string
-    agentID?: string
-  },
-) => Promise<SDKPermissionResult>
-
-/**
- * Subagent definition compatible with official Claude Agent SDK.
- * All fields from the official AgentDefinition are supported.
- */
-export type SDKAgentDefinition = {
-  description: string
-  prompt: string
-  tools?: string[]
-  disallowedTools?: string[]
-  model?: string
-  mcpServers?: Array<string | Record<string, McpServerConfig>>
-  skills?: string[]
-  initialPrompt?: string
-  maxTurns?: number
-  background?: boolean
-  memory?: AgentMemoryScope
-  effort?: EffortValue
-  permissionMode?: PermissionMode
-  criticalSystemReminder_EXPERIMENTAL?: string
+function normalizePromptInput(prompt: QueryInput): string | ContentBlockParam[] {
+  if (
+    prompt &&
+    typeof prompt === 'object' &&
+    'type' in prompt &&
+    prompt.type === 'user'
+  ) {
+    return prompt.message.content as string | ContentBlockParam[]
+  }
+  return prompt as string | ContentBlockParam[]
 }
 
-export type AgentOptions = {
-  /** Model ID (e.g. 'claude-sonnet-4-6', 'claude-opus-4-6') */
-  model?: string
-  /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
-  apiKey?: string
-  /** API base URL override (for third-party providers) */
-  baseURL?: string
-  /** Working directory for file/shell tools */
-  cwd?: string
-
-  // --- System Prompt ---
-  /** System prompt override. String or preset object. */
-  systemPrompt?: string | { type: 'preset'; preset: 'claude_code'; append?: string }
-  /** Append to default system prompt */
-  appendSystemPrompt?: string
-
-  // --- Tools ---
-  /** Available tools as Tool objects. Defaults to all built-in tools. */
-  tools?: Tools | string[] | { type: 'preset'; preset: 'claude_code' }
-  /** Tool names to pre-approve without prompting. */
-  allowedTools?: string[]
-  /** Tool names to explicitly disallow. */
-  disallowedTools?: string[]
-
-  // --- Model / Reasoning ---
-  /** Maximum number of agentic turns per query */
-  maxTurns?: number
-  /** Maximum USD budget per query */
-  maxBudgetUsd?: number
-  /** Extended thinking configuration */
-  thinking?: ThinkingConfig
-  /**
-   * Effort level controlling reasoning depth.
-   * 'low' | 'medium' | 'high' | 'max' or a numeric value.
-   */
-  effort?: EffortValue
-  /** Fallback model if primary is unavailable */
-  fallbackModel?: string
-  /** API-side task budget in tokens (alpha) */
-  taskBudget?: { total: number }
-  /** Beta features (e.g. 'context-1m-2025-08-07') */
-  betas?: string[]
-
-  // --- Output ---
-  /** Structured output JSON schema (Open Agent SDK style) */
-  jsonSchema?: Record<string, unknown>
-  /** Structured output format (official SDK style) */
-  outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }
-
-  // --- Permissions ---
-  /**
-   * Permission handler callback.
-   * Accepts BOTH the official SDK signature (toolName, input, options)
-   * and the engine internal signature.
-   */
-  canUseTool?: SDKCanUseTool | CanUseToolFn
-  /**
-   * Permission mode controlling tool approval behavior.
-   * - 'default': use canUseTool callback for approval decisions
-   * - 'acceptEdits': auto-approve file edits, ask for other actions
-   * - 'bypassPermissions': run every tool without prompts
-   * - 'plan': require explicit approval for all actions
-   * - 'dontAsk': deny if not pre-approved, never prompt
-   */
-  permissionMode?: PermissionMode
-  /** Safety flag: must be true when using permissionMode: 'bypassPermissions' */
-  allowDangerouslySkipPermissions?: boolean
-
-  // --- Streaming / Control ---
-  /** Abort signal for cancellation (Open Agent SDK style) */
-  abortSignal?: AbortSignal
-  /** Abort controller (official SDK style — takes precedence over abortSignal) */
-  abortController?: AbortController
-  /** Whether to include partial streaming events */
-  includePartialMessages?: boolean
-  /** Include hook lifecycle events in output stream */
-  includeHookEvents?: boolean
-
-  // --- Environment ---
-  /**
-   * Environment variables (compatible with @anthropic-ai/claude-agent-sdk).
-   * Supports: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
-   * ANTHROPIC_MODEL, etc.
-   */
-  env?: Record<string, string | undefined>
-
-  // --- MCP ---
-  /**
-   * MCP server configurations. Supports stdio, SSE, and streamable HTTP transports.
-   */
-  mcpServers?: Record<string, McpServerConfig>
-  /** Callback for handling MCP elicitation requests */
-  onElicitation?: (request: any, options: { signal: AbortSignal }) => Promise<any>
-
-  // --- Subagents ---
-  /**
-   * Custom subagent definitions. Full AgentDefinition fields supported.
-   */
-  agents?: Record<string, SDKAgentDefinition>
-  /** Named agent for the main thread (must be defined in `agents`) */
-  agent?: string
-
-  // --- Hooks ---
-  /**
-   * Lifecycle hooks for intercepting agent behavior.
-   * Supports all 26 hook events from the official SDK.
-   *
-   * @example
-   * ```typescript
-   * hooks: {
-   *   PostToolUse: [{ matcher: 'Edit|Write', hooks: [logFileChange] }],
-   *   PreToolUse: [{ hooks: [auditAllCalls] }],
-   *   Stop: [{ hooks: [onSessionEnd] }],
-   * }
-   * ```
-   */
-  hooks?: Partial<Record<HookEvent, SDKHookMatcher[]>>
-
-  // --- Session ---
-  /** Resume a previous session by ID */
-  resume?: string
-  /** Continue the most recent conversation in the current directory */
-  continue?: boolean
-  /** Custom session ID (must be valid UUID) */
-  sessionId?: string
-  /** Control session persistence to disk */
-  persistSession?: boolean
-  /**
-   * Load project settings from filesystem (CLAUDE.md, .claude/ directory).
-   * Set to ['project'] to enable.
-   */
-  settingSources?: string[]
-  /** Additional directories Claude can access beyond cwd */
-  additionalDirectories?: string[]
-
-  // --- Settings / Plugins ---
-  /** Additional settings (object or path to JSON file) */
-  settings?: string | Record<string, any>
-  /** Plugin configurations */
-  plugins?: Array<{ type: 'local'; path: string }>
-  /** Sandbox settings for command execution isolation */
-  sandbox?: Record<string, any>
-  /** Enforce strict MCP server config validation */
-  strictMcpConfig?: boolean
-  /** Per-tool configuration */
-  toolConfig?: Record<string, any>
-  /** Enable prompt suggestions after each turn */
-  promptSuggestions?: boolean
-  /** Enable periodic AI-generated progress summaries for subagents */
-  agentProgressSummaries?: boolean
-  /** Enable file checkpointing for rewindFiles() */
-  enableFileCheckpointing?: boolean
-  /** When resuming, fork to a new session instead of continuing */
-  forkSession?: boolean
-  /** Resume only up to this message UUID */
-  resumeSessionAt?: string
-  /** Callback for stderr output */
-  stderr?: (data: string) => void
-
-  // --- Debug ---
-  /** Enable debug logging */
-  debug?: boolean
-  /** Write debug logs to file */
-  debugFile?: string
+function createDisconnectedMcpConnection(
+  name: string,
+  config: McpServerConfig | any,
+  tools: ToolDefinition[] = [],
+  enabled = false,
+): MCPConnection {
+  return {
+    name,
+    status: 'disconnected',
+    enabled,
+    config,
+    tools,
+    listResources: async () => [],
+    readResource: async () => undefined,
+    subscribeResource: async () => {},
+    unsubscribeResource: async () => {},
+    close: async () => {},
+  }
 }
 
-type McpServerConfig =
-  | { command: string; args?: string[]; env?: Record<string, string>; type?: 'stdio' }
-  | { type: 'sse'; url: string; headers?: Record<string, string> }
-  | { type: 'http'; url: string; headers?: Record<string, string> }
+function extractSummary(messages: Message[]): string | undefined {
+  const lastAssistant = [...messages].reverse().find((message) => message.type === 'assistant')
+  if (!lastAssistant) return undefined
 
-export type QueryResult = {
-  /** Final text output from the assistant */
-  text: string
-  /** Token usage */
-  usage: { input_tokens: number; output_tokens: number }
-  /** Number of agentic turns */
-  num_turns: number
-  /** Duration in milliseconds */
-  duration_ms: number
-  /** All conversation messages */
-  messages: Message[]
-  /** Session ID (for resume) */
-  session_id: string
-  /** Total cost in USD */
-  total_cost_usd: number
+  return lastAssistant.message.content
+    .filter((block: any) => block.type === 'text')
+    .map((block: any) => block.text)
+    .join('\n')
+    .slice(0, 500) || undefined
 }
-
-// ============================================================================
-// Agent class
-// ============================================================================
 
 export class Agent {
-  private options: AgentOptions
-  private appState: AppState
-  private readFileCache: FileStateCache
-  private mutableMessages: Message[]
-  private tools: Tools
-  private resolvedModel: string
-  private mcpClients: any[]
-  private _initialized: Promise<void>
-  private _hooksRegistered = false
+  private baseOptions: AgentOptions
+  private cfg: AgentOptions
+  private toolPool: ToolDefinition[] = []
+  private modelId = 'claude-sonnet-4-6'
+  private apiType: ApiType = 'anthropic-messages'
+  private apiCredentials: { key?: string; baseUrl?: string } = {}
+  private provider: LLMProvider
+  private mcpLinks: MCPConnection[] = []
+  private history: NormalizedMessageParam[] = []
+  private messageLog: Message[] = []
+  private sessionMessages: SessionMessage[] = []
+  private setupDone: Promise<void>
+  private sid: string
+  private abortCtrl: AbortController | null = null
+  private currentEngine: QueryEngine | null = null
+  private hookRegistry: HookRegistry
+  private loadedSettings: LoadedSettingsSource[] = []
+  private loadedPlugins: LoadedPlugin[] = []
+  private claudeMdAppend = ''
+  private pluginSkillNames = new Set<string>()
+  private fileCheckpointState: FileCheckpointState = {}
+  private lastContextUsage: ContextUsageResult | null = null
+  private disabledMcpServers = new Set<string>()
+  private queuedSdkEvents: SDKMessage[] = []
 
-  constructor(options: AgentOptions) {
-    this.options = options
-    this.appState = getDefaultAppState()
-    this.readFileCache = createFileStateCacheWithSizeLimit(5000)
-    this.mutableMessages = []
-    this.mcpClients = []
-
-    this.resolveEnvOptions()
-    this.resolvedModel = this.options.model || 'claude-sonnet-4-6'
-
-    if (this.options.apiKey) {
-      process.env.ANTHROPIC_API_KEY = this.options.apiKey
-      // Clear ANTHROPIC_AUTH_TOKEN to prevent it from overriding x-api-key
-      // authentication when a third-party API endpoint is used.
-      // The internal configureApiKeyHeaders() prefers ANTHROPIC_AUTH_TOKEN
-      // over ANTHROPIC_API_KEY, which causes 401 errors with providers
-      // that don't recognize the token.
-      delete process.env.ANTHROPIC_AUTH_TOKEN
-    }
-    if (this.options.baseURL) {
-      process.env.ANTHROPIC_BASE_URL = this.options.baseURL
-    }
-
-    // Resolve tools — support string[], preset, or Tool objects
-    this.tools = this.resolveTools(this.options.tools)
-
-    this._initialized = this._init()
+  constructor(options: AgentOptions = {}) {
+    this.baseOptions = { ...options }
+    this.cfg = { ...options }
+    this.sid = this.cfg.sessionId ?? crypto.randomUUID()
+    this.provider = createProvider('anthropic-messages', {})
+    this.hookRegistry = createHookRegistry()
+    initBundledSkills()
+    this.setupDone = this.setup()
   }
 
-  private resolveTools(toolsOption?: AgentOptions['tools']): Tools {
-    if (!toolsOption) return getAllBaseTools()
-    if (Array.isArray(toolsOption)) {
-      if (toolsOption.length === 0) return []
-      // If first element is string, resolve by name from built-in tools
-      if (typeof toolsOption[0] === 'string') {
-        const nameSet = new Set(toolsOption as string[])
-        return getAllBaseTools().filter(t => nameSet.has(t.name))
+  private readEnv(key: string): string | undefined {
+    return process.env[key] || undefined
+  }
+
+  private pickCredentials(): { key?: string; baseUrl?: string } {
+    const envMap = this.cfg.env
+    return {
+      key:
+        this.cfg.apiKey ??
+        envMap?.CODEANY_API_KEY ??
+        envMap?.CODEANY_AUTH_TOKEN ??
+        this.readEnv('CODEANY_API_KEY') ??
+        this.readEnv('CODEANY_AUTH_TOKEN'),
+      baseUrl:
+        this.cfg.baseURL ??
+        envMap?.CODEANY_BASE_URL ??
+        this.readEnv('CODEANY_BASE_URL'),
+    }
+  }
+
+  private resolveApiType(): ApiType {
+    if (this.cfg.apiType) return this.cfg.apiType
+
+    const envType =
+      this.cfg.env?.CODEANY_API_TYPE ??
+      this.readEnv('CODEANY_API_TYPE')
+    if (envType === 'openai-completions' || envType === 'anthropic-messages') {
+      return envType
+    }
+
+    const baseUrl = (
+      this.apiCredentials.baseUrl ??
+      this.cfg.baseURL ??
+      this.cfg.env?.CODEANY_BASE_URL ??
+      this.readEnv('CODEANY_BASE_URL') ??
+      ''
+    ).toLowerCase()
+    if (baseUrl) {
+      if (baseUrl.includes('/anthropic') || /\/messages\/?$/.test(baseUrl)) {
+        return 'anthropic-messages'
       }
-      return toolsOption as Tools
+      if (baseUrl.includes('/chat/completions')) {
+        return 'openai-completions'
+      }
     }
-    if ('type' in toolsOption && toolsOption.type === 'preset') {
-      return getAllBaseTools()
+
+    const model = this.modelId.toLowerCase()
+    if (
+      model.includes('gpt-') ||
+      model.includes('o1') ||
+      model.includes('o3') ||
+      model.includes('o4') ||
+      model.includes('deepseek') ||
+      model.includes('qwen') ||
+      model.includes('yi-') ||
+      model.includes('glm') ||
+      model.includes('mistral') ||
+      model.includes('gemma')
+    ) {
+      return 'openai-completions'
     }
-    return getAllBaseTools()
+
+    return 'anthropic-messages'
   }
 
-  private async _init(): Promise<void> {
-    if (this.options.mcpServers) {
-      try {
-        const { connectToServer } = await import('./services/mcp/client.js')
+  private refreshResolvedConfig(): void {
+    this.apiCredentials = this.pickCredentials()
+    this.modelId = this.cfg.model ?? this.readEnv('CODEANY_MODEL') ?? 'claude-sonnet-4-6'
+    this.apiType = this.resolveApiType()
+    this.provider = createProvider(this.apiType, {
+      apiKey: this.apiCredentials.key,
+      baseURL: this.apiCredentials.baseUrl,
+    })
+    if (this.cfg.sessionId) {
+      this.sid = this.cfg.sessionId
+    }
+  }
 
-        for (const [name, config] of Object.entries(this.options.mcpServers)) {
-          try {
-            const scopedConfig = { ...config, scope: 'dynamic' as const }
-            const connection = await connectToServer(name, scopedConfig as any)
-            this.mcpClients.push(connection)
+  private resetHookRegistry(): void {
+    this.hookRegistry = createHookRegistry()
 
-            if (connection.status === 'connected' && connection.client) {
-              const { fetchToolsForClient } = await import('./services/mcp/client.js')
-              const mcpTools = await fetchToolsForClient(connection)
-              if (mcpTools?.length) {
-                this.tools = [...this.tools, ...mcpTools]
-              }
-            }
-          } catch (err: any) {
-            console.error(`[MCP] Failed to connect to "${name}": ${err.message}`)
+    if (this.cfg.hooks) {
+      for (const [event, defs] of Object.entries(this.cfg.hooks)) {
+        for (const def of defs) {
+          for (const handler of def.hooks) {
+            this.hookRegistry.register(event as any, {
+              matcher: def.matcher,
+              timeout: def.timeout,
+              handler: async (input) => {
+                const result = await handler(input, input.toolUseId || '', {
+                  signal: this.abortCtrl?.signal || new AbortController().signal,
+                })
+                return result || undefined
+              },
+            })
           }
         }
-      } catch (err: any) {
-        console.error(`[MCP] MCP client initialization failed: ${err.message}`)
+      }
+    }
+
+    for (const plugin of this.loadedPlugins) {
+      if (!plugin.hooks) continue
+      this.hookRegistry.registerFromConfig(plugin.hooks)
+    }
+  }
+
+  private async loadAndApplyClaudeMdFiles(cwd: string): Promise<void> {
+    try {
+      const claudeMdFiles = await loadClaudeMdFiles(cwd)
+      if (claudeMdFiles.length === 0) return
+
+      const sections: string[] = []
+      for (const file of claudeMdFiles) {
+        sections.push(file.content.trim())
+
+        // Fire InstructionsLoaded hook for each loaded file
+        if (this.hookRegistry.hasHooks('InstructionsLoaded')) {
+          const hookResult = await this.hookRegistry.executeDetailed('InstructionsLoaded', {
+            event: 'InstructionsLoaded',
+            file_path: file.path,
+            memory_type: file.memoryType,
+            load_reason: 'session_start',
+            sessionId: this.sid,
+          })
+          // Queue hook events to be emitted on next query
+          for (const evt of hookResult.events) {
+            this.queuedSdkEvents.push(evt)
+          }
+        }
+      }
+
+      this.claudeMdAppend = sections.join('\n\n---\n\n')
+    } catch {
+      // CLAUDE.md loading is best-effort
+    }
+  }
+
+  private unregisterPluginSkills(): void {
+    for (const name of this.pluginSkillNames) {
+      unregisterSkill(name)
+    }
+    this.pluginSkillNames.clear()
+  }
+
+  private registerPluginSkills(): void {
+    this.unregisterPluginSkills()
+    for (const plugin of this.loadedPlugins) {
+      for (const skill of plugin.skills || []) {
+        registerSkill(skill)
+        this.pluginSkillNames.add(skill.name)
       }
     }
   }
 
-  private resolveEnvOptions(): void {
-    const env = this.options.env
+  private getPluginAgents(): Record<string, NonNullable<AgentOptions['agents']>[string]> {
+    const merged: Record<string, NonNullable<AgentOptions['agents']>[string]> = {}
+    for (const plugin of this.loadedPlugins) {
+      Object.assign(merged, plugin.agents || {})
+    }
+    return merged
+  }
 
-    if (!this.options.apiKey) {
-      this.options.apiKey =
-        env?.ANTHROPIC_API_KEY || env?.ANTHROPIC_AUTH_TOKEN ||
-        process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
+  private getPluginTools(): ToolDefinition[] {
+    return this.loadedPlugins.flatMap((plugin) => plugin.tools || [])
+  }
+
+  private getPluginMcpServers(): Record<string, McpServerConfig | any> {
+    const merged: Record<string, McpServerConfig | any> = {}
+    for (const plugin of this.loadedPlugins) {
+      Object.assign(merged, plugin.mcpServers || {})
     }
-    if (!this.options.baseURL) {
-      this.options.baseURL =
-        env?.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL
+    return merged
+  }
+
+  private buildBaseToolPool(options: AgentOptions = this.cfg): ToolDefinition[] {
+    const pluginTools = this.getPluginTools()
+    const raw = options.tools
+    let pool: ToolDefinition[]
+
+    if (!raw || (typeof raw === 'object' && !Array.isArray(raw) && 'type' in raw)) {
+      pool = [...getAllBaseTools(), ...pluginTools]
+    } else if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'string') {
+      pool = filterTools([...getAllBaseTools(), ...pluginTools], raw as string[])
+    } else {
+      pool = [...(raw as ToolDefinition[]), ...pluginTools]
     }
-    if (!this.options.model) {
-      this.options.model =
-        env?.ANTHROPIC_MODEL || process.env.ANTHROPIC_MODEL
+
+    return filterTools(pool, options.allowedTools, options.disallowedTools)
+  }
+
+  private getConfiguredMcpServers(): Record<string, McpServerConfig | any> {
+    return {
+      ...(this.cfg.mcpServers || {}),
+      ...this.getPluginMcpServers(),
     }
   }
 
-  /**
-   * Register SDK hook callbacks into the engine's global hook registry.
-   * Converts user-facing SDKHookCallback into engine HookCallback format.
-   */
-  private registerHooks(hooks: Partial<Record<HookEvent, SDKHookMatcher[]>>): void {
-    const engineHooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {}
+  private async syncMcpConnections(): Promise<void> {
+    await closeAllConnections(this.mcpLinks)
+    this.mcpLinks = []
 
-    for (const [event, matchers] of Object.entries(hooks)) {
-      if (!matchers) continue
-      engineHooks[event as HookEvent] = matchers.map(m => ({
-        matcher: m.matcher,
-        hooks: m.hooks.map(fn => ({
-          type: 'callback' as const,
-          callback: async (
-            input: HookInput,
-            toolUseID: string | null,
-            signal: AbortSignal | undefined,
-          ): Promise<HookJSONOutput> => {
-            return fn(input, toolUseID ?? undefined, { signal: signal ?? new AbortController().signal })
-          },
-        })),
-      }))
+    const configs = this.getConfiguredMcpServers()
+    for (const [name, config] of Object.entries(configs)) {
+      const originalResourceUpdate = (config as any).onResourceUpdate
+      const wrappedConfig = {
+        ...config,
+        onResourceUpdate: async (update: any) => {
+          if (update.kind === 'elicitation_complete' && update.elicitationId) {
+            this.queuedSdkEvents.push({
+              type: 'system',
+              subtype: 'elicitation_complete',
+              mcp_server_name: name,
+              elicitation_id: update.elicitationId,
+              session_id: this.sid,
+            })
+          } else {
+            this.queuedSdkEvents.push({
+              type: 'system',
+              subtype: 'status',
+              message: `MCP ${name} ${update.kind} updated`,
+              session_id: this.sid,
+              permissionMode: this.cfg.permissionMode,
+            })
+          }
+          await originalResourceUpdate?.(update)
+        },
+      }
+
+      if (this.disabledMcpServers.has(name)) {
+        const tools = isSdkServerConfig(wrappedConfig) ? wrappedConfig.tools : []
+        this.mcpLinks.push(createDisconnectedMcpConnection(name, wrappedConfig, tools, false))
+        continue
+      }
+
+      if (isSdkServerConfig(wrappedConfig)) {
+        this.mcpLinks.push({
+          name,
+          status: 'connected',
+          enabled: true,
+          config: wrappedConfig,
+          tools: wrappedConfig.tools,
+          listResources: async () => [],
+          readResource: async () => undefined,
+          subscribeResource: async () => {},
+          unsubscribeResource: async () => {},
+          close: async () => {},
+        })
+        continue
+      }
+
+      const connection = await connectMCPServer(name, wrappedConfig)
+      connection.enabled = true
+      connection.config = wrappedConfig
+      this.mcpLinks.push(connection)
     }
 
-    registerHookCallbacks(engineHooks)
-    this._hooksRegistered = true
+    setMcpConnections(this.mcpLinks.filter((conn) => conn.enabled))
   }
 
-  /**
-   * Resolve systemPrompt option: supports string or preset object.
-   */
-  private resolveSystemPrompt(opts: AgentOptions): { custom?: string; append?: string } {
-    const sp = opts.systemPrompt
-    if (!sp) return { append: opts.appendSystemPrompt }
-    if (typeof sp === 'string') return { custom: sp, append: opts.appendSystemPrompt }
-    // Preset object: { type: 'preset', preset: 'claude_code', append?: string }
-    if (sp.type === 'preset' && sp.preset === 'claude_code') {
-      return { append: [opts.appendSystemPrompt, sp.append].filter(Boolean).join('\n') || undefined }
+  private rebuildToolPool(options: AgentOptions = this.cfg): void {
+    const baseTools = this.buildBaseToolPool(options)
+    const mcpTools = this.mcpLinks
+      .filter((conn) => conn.enabled && conn.status === 'connected')
+      .flatMap((conn) => conn.tools)
+
+    this.toolPool = assembleToolPool(
+      baseTools,
+      mcpTools,
+      options.allowedTools,
+      options.disallowedTools,
+    )
+  }
+
+  private drainQueuedSdkEvents(): SDKMessage[] {
+    const events = [...this.queuedSdkEvents]
+    this.queuedSdkEvents.length = 0
+    return events
+  }
+
+  private async resumeSessionIfNeeded(): Promise<void> {
+    let resumeId = this.cfg.resume
+
+    if (!resumeId && this.cfg.continue) {
+      const latest = await listSessions({
+        dir: this.cfg.cwd || process.cwd(),
+        limit: 1,
+      })
+      resumeId = latest[0]?.id
     }
-    return { append: opts.appendSystemPrompt }
+
+    if (resumeId && this.cfg.forkSession) {
+      const forked = await forkStoredSession(resumeId, {
+        dir: this.cfg.cwd || process.cwd(),
+        newSessionId: this.cfg.sessionId,
+      })
+      resumeId = typeof forked === 'string' ? forked : forked?.sessionId
+    }
+
+    if (!resumeId) return
+
+    const sessionData = await loadSession(resumeId)
+    if (!sessionData) return
+
+    this.history = sessionData.messages
+    this.sessionMessages = sessionData.sessionMessages || []
+    this.fileCheckpointState = sessionData.checkpoints || {}
+    this.sid = resumeId
   }
 
-  async *query(
-    prompt: string,
+  private async setup(): Promise<void> {
+    const cwd = this.cfg.cwd || process.cwd()
+    if (this.cfg.settingSources?.length) {
+      this.loadedSettings = await loadSettingsFromSources(cwd, this.cfg.settingSources)
+      this.cfg = mergeAgentOptions(
+        {} as AgentOptions,
+        [
+          ...this.loadedSettings.map((source) => source.settings as Partial<AgentOptions> & Record<string, unknown>),
+          this.baseOptions as Partial<AgentOptions> & Record<string, unknown>,
+        ],
+      )
+    }
+
+    this.refreshResolvedConfig()
+    this.loadedPlugins = await loadPlugins(this.cfg.cwd || process.cwd(), this.cfg.plugins)
+    this.registerPluginSkills()
+    this.resetHookRegistry()
+
+    // Load CLAUDE.md files from filesystem hierarchy and append to system prompt
+    await this.loadAndApplyClaudeMdFiles(cwd)
+
+    const mergedAgents = {
+      ...this.getPluginAgents(),
+      ...(this.cfg.agents || {}),
+    }
+    if (Object.keys(mergedAgents).length > 0) {
+      registerAgents(mergedAgents)
+    }
+
+    await this.syncMcpConnections()
+    this.rebuildToolPool()
+    await this.resumeSessionIfNeeded()
+  }
+
+  private getEffectiveOptions(overrides?: Partial<AgentOptions>): AgentOptions {
+    const merged = { ...this.cfg, ...overrides }
+    // thinkingConfig is an alias for thinking (thinking takes precedence)
+    if (!merged.thinking && merged.thinkingConfig) {
+      merged.thinking = merged.thinkingConfig
+    }
+    if (!merged.thinking && merged.maxThinkingTokens !== undefined) {
+      merged.thinking = merged.maxThinkingTokens === null
+        ? { type: 'disabled' }
+        : { type: 'enabled', budgetTokens: merged.maxThinkingTokens }
+    }
+    // allowDangerouslySkipPermissions forces bypassPermissions mode
+    if (merged.allowDangerouslySkipPermissions && !merged.permissionMode) {
+      merged.permissionMode = 'bypassPermissions'
+    }
+    return merged
+  }
+
+  private getCanUseTool(opts: AgentOptions): CanUseToolFn {
+    if (opts.canUseTool) return opts.canUseTool
+
+    const permMode = opts.permissionMode ?? 'bypassPermissions'
+    const readOnlyNames = new Set([
+      'Read',
+      'Glob',
+      'Grep',
+      'WebFetch',
+      'WebSearch',
+      'ListMcpResourcesTool',
+      'ReadMcpResourceTool',
+      'TaskOutput',
+      'TaskGet',
+      'TaskList',
+      'ToolSearch',
+      'AskUserQuestion',
+    ])
+    const editNames = new Set([
+      'Write',
+      'Edit',
+      'NotebookEdit',
+      'TodoWrite',
+      'Config',
+    ])
+    const privilegedNames = new Set([
+      'Bash',
+      'Agent',
+      'SendMessage',
+      'TeamCreate',
+      'TeamDelete',
+      'CronCreate',
+      'CronDelete',
+      'RemoteTrigger',
+    ])
+
+    return async (tool, input, metadata) => {
+      const base = {
+        title: metadata?.title,
+        displayName: metadata?.displayName,
+        description: metadata?.description,
+        blockedPath: metadata?.blockedPath,
+        permissionSuggestions: metadata?.permissionSuggestions,
+        decisionReason: metadata?.decisionReason,
+      }
+
+      if (permMode === 'bypassPermissions' || permMode === 'dontAsk' || permMode === 'auto') {
+        return { behavior: 'allow', ...base }
+      }
+
+      if (permMode === 'plan') {
+        if (tool.isReadOnly?.() || readOnlyNames.has(tool.name) || tool.name === 'EnterPlanMode' || tool.name === 'ExitPlanMode') {
+          return { behavior: 'allow', ...base }
+        }
+        return {
+          behavior: 'deny',
+          message: `Plan mode blocks mutating tool "${tool.name}" until planning is complete.`,
+          ...base,
+        }
+      }
+
+      if (permMode === 'acceptEdits') {
+        if (privilegedNames.has(tool.name)) {
+          return {
+            behavior: 'deny',
+            message: `acceptEdits mode does not auto-allow privileged tool "${tool.name}".`,
+            ...base,
+          }
+        }
+        if (tool.isReadOnly?.() || readOnlyNames.has(tool.name) || editNames.has(tool.name) || tool.name === 'TaskStop') {
+          return { behavior: 'allow', ...base }
+        }
+        return { behavior: 'deny', message: `Tool "${tool.name}" is not allowed in acceptEdits mode.`, ...base }
+      }
+
+      if (permMode === 'default') {
+        if (tool.isReadOnly?.() || readOnlyNames.has(tool.name)) {
+          return { behavior: 'allow', ...base }
+        }
+        return {
+          behavior: 'deny',
+          message: `Default mode requires explicit approval for "${tool.name}". Provide a custom canUseTool callback to allow it.`,
+          ...base,
+        }
+      }
+
+      return { behavior: 'allow', ...base }
+    }
+  }
+
+  private async *runSinglePrompt(
+    prompt: QueryInput,
     overrides?: Partial<AgentOptions>,
   ): AsyncGenerator<SDKMessage, void> {
-    await this._initialized
+    await this.setupDone
 
-    const opts = { ...this.options, ...overrides }
+    const opts = this.getEffectiveOptions(overrides)
     const cwd = opts.cwd || process.cwd()
 
-    // Safety check for bypassPermissions
-    if (opts.permissionMode === 'bypassPermissions' && opts.allowDangerouslySkipPermissions === false) {
-      throw new Error('permissionMode "bypassPermissions" requires allowDangerouslySkipPermissions: true')
-    }
-
-    // Register hooks (once per agent, or if overrides provide new hooks)
-    if (opts.hooks && !this._hooksRegistered) {
-      this.registerHooks(opts.hooks)
-    }
-    if (overrides?.hooks) {
-      this.registerHooks(overrides.hooks)
-    }
-
-    // ---- Wire-through: effort → appState.effortValue ----
-    if (opts.effort !== undefined) {
-      const parsed = typeof opts.effort === 'string' || typeof opts.effort === 'number'
-        ? parseEffortValue(opts.effort)
-        : opts.effort
-      if (parsed !== undefined) {
-        this.appState = { ...this.appState, effortValue: parsed }
-      }
-    }
-
-    // ---- Wire-through: betas → SDK betas registry ----
-    if (opts.betas?.length) {
-      setSdkBetas(filterAllowedSdkBetas(opts.betas))
-    }
-
-    // ---- Wire-through: sessionId → engine session identity ----
-    if (opts.sessionId) {
-      switchSession(opts.sessionId, cwd)
-    }
-
-    // ---- Wire-through: persistSession → session storage flag ----
-    if (opts.persistSession !== undefined) {
-      setSessionPersistenceDisabled(!opts.persistSession)
-    }
-
-    // ---- Wire-through: settingSources → settings loader ----
-    if (opts.settingSources?.length) {
-      setAllowedSettingSources(opts.settingSources as any)
-    }
-
-    // ---- Wire-through: additionalDirectories → CLAUDE.md + permissions ----
-    if (opts.additionalDirectories?.length) {
-      setAdditionalDirectoriesForClaudeMd(opts.additionalDirectories)
-    }
-
-    // ---- Wire-through: includeHookEvents → hook event streaming ----
-    if (opts.includeHookEvents) {
-      setAllHookEventsEnabled(true)
-    }
-
-    // ---- Wire-through: toolConfig → per-tool configuration ----
-    if (opts.toolConfig?.askUserQuestion?.previewFormat) {
-      setQuestionPreviewFormat(opts.toolConfig.askUserQuestion.previewFormat)
-    }
-
-    // ---- Wire-through: promptSuggestions → appState ----
-    if (opts.promptSuggestions !== undefined) {
-      this.appState = { ...this.appState, promptSuggestionEnabled: opts.promptSuggestions }
-    }
-
-    // ---- Wire-through: agentProgressSummaries → bootstrap state ----
-    if (opts.agentProgressSummaries) {
-      setSdkAgentProgressSummariesEnabled(true)
-    }
-
-    // ---- Wire-through: settings → flag settings layer ----
-    if (opts.settings) {
-      if (typeof opts.settings === 'string') {
-        setFlagSettingsPath(opts.settings)
-      } else {
-        setFlagSettingsInline(opts.settings)
-      }
-    }
-
-    // ---- Wire-through: plugins → inline plugin paths ----
-    if (opts.plugins?.length) {
-      const paths = opts.plugins.map(p => p.path)
-      setInlinePlugins(paths)
-      try {
-        const { clearPluginCache } = await import('./utils/plugins/pluginLoader.js')
-        clearPluginCache('Agent plugins option')
-      } catch { /* best-effort */ }
-    }
-
-    // ---- Wire-through: sandbox → SandboxManager ----
-    if (opts.sandbox) {
-      try {
-        const { SandboxManager } = await import('./utils/sandbox/sandbox-adapter.js')
-        SandboxManager.setSandboxSettings?.(opts.sandbox)
-        if (opts.sandbox.enabled) {
-          await SandboxManager.initialize?.()
-        }
-      } catch { /* sandbox runtime may not be available */ }
-    }
-
-    // ---- Wire-through: enableFileCheckpointing → env var ----
-    if (opts.enableFileCheckpointing) {
-      process.env.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING = '1'
-    }
-
-    // ---- Wire-through: resume → load previous session messages ----
-    if (opts.resume && this.mutableMessages.length === 0) {
-      try {
-        const { getTranscriptPathForSession } = await import('./utils/sessionStorage.js')
-        const { loadTranscriptFromFile } = await import('./utils/sessionStorage.js')
-        switchSession(opts.resume, cwd)
-        const transcriptPath = getTranscriptPathForSession(opts.resume)
-        const loaded = await loadTranscriptFromFile(transcriptPath)
-        if (loaded?.messages?.length) {
-          this.mutableMessages.push(...loaded.messages)
-        }
-      } catch {
-        // Session not found or corrupted — start fresh
-      }
-    }
-
-    // ---- Wire-through: continue → resume most recent session ----
-    if (opts.continue && !opts.resume && this.mutableMessages.length === 0) {
-      try {
-        const { listSessionsImpl } = await import('./utils/listSessionsImpl.js')
-        const sessions = await listSessionsImpl({ dir: cwd, limit: 1 })
-        if (sessions.length > 0) {
-          const lastSession = sessions[0]
-          const sid = (lastSession as any).sessionId
-          if (sid) {
-            const { getTranscriptPathForSession } = await import('./utils/sessionStorage.js')
-            const { loadTranscriptFromFile } = await import('./utils/sessionStorage.js')
-            switchSession(sid, cwd)
-            const transcriptPath = getTranscriptPathForSession(sid)
-            const loaded = await loadTranscriptFromFile(transcriptPath)
-            if (loaded?.messages?.length) {
-              this.mutableMessages.push(...loaded.messages)
-            }
-          }
-        }
-      } catch {
-        // No previous session — start fresh
-      }
-    }
-
-    // ---- Wire-through: debugFile → env var for debug output ----
-    if (opts.debugFile) {
-      process.env.CLAUDE_CODE_DEBUG_FILE = opts.debugFile
-    }
-
-    // Resolve JSON schema from either jsonSchema or outputFormat
-    const jsonSchema = opts.jsonSchema ?? opts.outputFormat?.schema
-
-    const allowedToolSet = opts.allowedTools ? new Set(opts.allowedTools) : null
-    const disallowedToolSet = opts.disallowedTools ? new Set(opts.disallowedTools) : null
-    const permMode = opts.permissionMode ?? 'bypassPermissions'
-
-    // Build canUseTool — adapt from SDK-style (toolName, input, options) to engine-style
-    const userCanUseTool = opts.canUseTool
-    const canUseTool: CanUseToolFn = userCanUseTool
-      ? (async (tool, input, _toolUseContext, _assistantMessage, toolUseID) => {
-          // Detect if user passed the official SDK-style callback (3 args: toolName, input, options)
-          // vs the engine-style callback (5+ args)
-          // Official SDK signature: (toolName: string, input, options: { signal, ... })
-          // We try calling it as SDK-style first — toolName is string, 3rd arg is options object
-          try {
-            const result = await (userCanUseTool as any)(
-              tool.name,
-              input,
-              {
-                signal: new AbortController().signal,
-                toolUseID: toolUseID || '',
-              },
-            )
-            return result
-          } catch {
-            // Fallback: try calling as engine-style
-            return await (userCanUseTool as any)(tool, input, _toolUseContext, _assistantMessage, toolUseID)
-          }
-        })
-      : (async (tool: any, _input: any) => {
-          if (disallowedToolSet?.has(tool.name)) {
-            return { behavior: 'deny' as const, message: 'Tool is disallowed', decisionReason: { type: 'mode' as const, mode: permMode } }
-          }
-          if (allowedToolSet && !allowedToolSet.has(tool.name)) {
-            if (permMode === 'bypassPermissions') {
-              return { behavior: 'allow' as const, updatedInput: undefined }
-            }
-            return { behavior: 'deny' as const, message: 'Tool not in allowedTools', decisionReason: { type: 'mode' as const, mode: permMode } }
-          }
-
-          switch (permMode) {
-            case 'bypassPermissions':
-            case 'acceptEdits':
-              return { behavior: 'allow' as const, updatedInput: undefined }
-            case 'plan':
-              return { behavior: 'allow' as const, updatedInput: undefined }
-            case 'dontAsk':
-              if (allowedToolSet?.has(tool.name)) {
-                return { behavior: 'allow' as const, updatedInput: undefined }
-              }
-              return { behavior: 'deny' as const, message: 'dontAsk mode — tool not pre-approved', decisionReason: { type: 'mode' as const, mode: 'dontAsk' } }
-            default:
-              return { behavior: 'allow' as const, updatedInput: undefined }
-          }
-        })
-
-    let commands: any[] = []
-    try {
-      commands = await getCommands(cwd)
-    } catch {
-      // Commands may fail in some environments
-    }
-
-    // Support both official SDK (abortController) and our own (abortSignal)
-    const abortController = opts.abortController ?? new AbortController()
-    this._activeAbortController = abortController
+    this.abortCtrl = opts.abortController || new AbortController()
     if (opts.abortSignal) {
-      opts.abortSignal.addEventListener('abort', () => abortController.abort(), { once: true })
+      opts.abortSignal.addEventListener('abort', () => this.abortCtrl?.abort(), { once: true })
     }
 
-    // Filter tools by allowedTools/disallowedTools
-    let tools = this.tools
-    if (disallowedToolSet) {
-      tools = tools.filter(t => !disallowedToolSet.has(t.name))
+    let systemPrompt: string | undefined
+    let appendSystemPrompt = opts.appendSystemPrompt
+    if (typeof opts.systemPrompt === 'object' && opts.systemPrompt?.type === 'preset') {
+      systemPrompt = undefined
+      if (opts.systemPrompt.append) {
+        appendSystemPrompt = [appendSystemPrompt, opts.systemPrompt.append].filter(Boolean).join('\n')
+      }
+    } else {
+      systemPrompt = opts.systemPrompt as string | undefined
     }
-    if (allowedToolSet) {
-      tools = tools.filter(t => allowedToolSet.has(t.name))
+
+    // Append loaded CLAUDE.md content to system prompt
+    if (this.claudeMdAppend) {
+      appendSystemPrompt = [appendSystemPrompt, this.claudeMdAppend].filter(Boolean).join('\n\n')
     }
 
-    // Build full agent definitions from options
-    const agents = opts.agents
-      ? Object.entries(opts.agents).map(([name, def]) => ({
-          agentType: name,
-          whenToUse: def.description,
-          getSystemPrompt: () => def.prompt,
-          source: 'flagSettings' as const,
-          tools: def.tools,
-          disallowedTools: def.disallowedTools,
-          model: def.model,
-          skills: def.skills,
-          initialPrompt: def.initialPrompt,
-          maxTurns: def.maxTurns,
-          background: def.background,
-          memory: def.memory,
-          effort: def.effort,
-          permissionMode: def.permissionMode,
-          criticalSystemReminder_EXPERIMENTAL: def.criticalSystemReminder_EXPERIMENTAL,
-        }))
-      : []
+    let tools = this.toolPool
+    if (overrides?.allowedTools || overrides?.disallowedTools) {
+      tools = filterTools(tools, overrides.allowedTools, overrides.disallowedTools)
+    }
+    if (overrides?.tools) {
+      const raw = overrides.tools
+      if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'string') {
+        tools = filterTools(this.buildBaseToolPool(opts), raw as string[])
+      } else if (Array.isArray(raw)) {
+        tools = raw as ToolDefinition[]
+      }
+    }
 
-    const { custom: customSystemPrompt, append: appendSystemPrompt } = this.resolveSystemPrompt(opts)
+    let provider = this.provider
+    if (overrides?.apiType || overrides?.apiKey || overrides?.baseURL) {
+      const resolvedApiType = overrides.apiType ?? this.apiType
+      provider = createProvider(resolvedApiType, {
+        apiKey: overrides.apiKey ?? this.apiCredentials.key,
+        baseURL: overrides.baseURL ?? this.apiCredentials.baseUrl,
+      })
+    }
 
-    const generator = ask({
-      commands,
-      prompt,
-      cwd,
-      tools,
-      mcpClients: this.mcpClients,
-      verbose: opts.debug ?? false,
-      thinkingConfig: opts.thinking,
-      maxTurns: opts.maxTurns,
-      maxBudgetUsd: opts.maxBudgetUsd,
-      taskBudget: opts.taskBudget,
-      canUseTool,
-      mutableMessages: this.mutableMessages,
-      getReadFileCache: () => this.readFileCache,
-      setReadFileCache: (cache: FileStateCache) => { this.readFileCache = cache },
-      customSystemPrompt,
-      appendSystemPrompt,
-      userSpecifiedModel: this.resolvedModel,
-      fallbackModel: opts.fallbackModel,
-      getAppState: () => this.appState,
-      setAppState: (fn: (prev: AppState) => AppState) => {
-        this.appState = fn(this.appState)
-      },
-      abortController,
-      replayUserMessages: false,
-      includePartialMessages: opts.includePartialMessages ?? false,
-      agents: agents as any,
-      jsonSchema,
-      handleElicitation: opts.onElicitation,
+    const normalizedPrompt = normalizePromptInput(prompt)
+    const userMessage = toSessionMessage('user', normalizedPrompt)
+    this.sessionMessages.push(userMessage)
+    this.messageLog.push({
+      type: 'user',
+      message: { role: 'user', content: normalizedPrompt },
+      uuid: userMessage.uuid,
+      timestamp: userMessage.timestamp,
     })
 
-    yield* generator
+    const engine = new QueryEngine({
+      cwd,
+      model: opts.model || this.modelId,
+      provider,
+      tools,
+      systemPrompt,
+      appendSystemPrompt,
+      maxTurns: opts.maxTurns ?? 10,
+      maxBudgetUsd: opts.maxBudgetUsd,
+      maxTokens: opts.maxTokens ?? 16384,
+      thinking: opts.thinking,
+      jsonSchema: opts.jsonSchema,
+      outputFormat: opts.outputFormat,
+      effort: opts.effort,
+      canUseTool: this.getCanUseTool(opts),
+      includePartialMessages: opts.includePartialMessages ?? false,
+      abortSignal: this.abortCtrl.signal,
+      agents: {
+        ...this.getPluginAgents(),
+        ...(opts.agents || {}),
+      },
+      hookRegistry: this.hookRegistry,
+      sessionId: this.sid,
+      permissionMode: opts.permissionMode,
+      promptSuggestions: opts.promptSuggestions,
+      additionalDirectories: opts.additionalDirectories,
+      sandbox: opts.sandbox,
+      toolConfig: opts.toolConfig,
+      currentUserMessageId: userMessage.uuid,
+      fileCheckpointState: this.fileCheckpointState,
+      mcpServerStatuses: this.collectMcpServerStatuses().map((status) => ({
+        name: status.name,
+        status: status.status,
+      })),
+    })
+    this.currentEngine = engine
+
+    for (const msg of this.history) {
+      engine.messages.push(msg)
+    }
+
+    for (const queued of this.drainQueuedSdkEvents()) {
+      yield queued
+    }
+
+    yield {
+      type: 'auth_status',
+      isAuthenticating: false,
+      output: this.apiCredentials.key
+        ? [`Using ${this.apiType} credentials`]
+        : ['No API key configured'],
+      error: this.apiCredentials.key ? undefined : 'Missing API key',
+      session_id: this.sid,
+    }
+
+    for await (const event of engine.submitMessage(normalizedPrompt)) {
+      if (event.type === 'assistant') {
+        const assistantMessage = toSessionMessage('assistant', event.message)
+        this.sessionMessages.push(assistantMessage)
+        this.messageLog.push({
+          type: 'assistant',
+          message: event.message,
+          uuid: assistantMessage.uuid,
+          timestamp: assistantMessage.timestamp,
+        })
+      } else if (event.type === 'system') {
+        this.sessionMessages.push(toSessionMessage('system', event))
+      }
+
+      yield event
+      for (const queued of this.drainQueuedSdkEvents()) {
+        yield queued
+      }
+    }
+
+    this.history = engine.getMessages()
+    this.lastContextUsage = engine.getContextUsage()
+    this.currentEngine = null
+
+    if (opts.persistSession !== false && this.history.length > 0) {
+      try {
+        await saveSession(this.sid, this.history, {
+          cwd,
+          model: opts.model || this.modelId,
+          summary: extractSummary(this.messageLog),
+          sessionMessages: this.sessionMessages,
+          checkpoints: this.fileCheckpointState,
+        })
+        yield {
+          type: 'system',
+          subtype: 'files_persisted',
+          files: [
+            {
+              filename: 'transcript.json',
+              file_id: this.sid,
+            },
+          ],
+          failed: [],
+          processed_at: new Date().toISOString(),
+          session_id: this.sid,
+        }
+      } catch {
+        // Session persistence is best-effort.
+      }
+    }
+
+    for (const queued of this.drainQueuedSdkEvents()) {
+      yield queued
+    }
+  }
+
+  private async *runPromptQueue(
+    inputs: AsyncIterable<QueryInput>,
+    overrides?: Partial<AgentOptions>,
+  ): AsyncGenerator<SDKMessage, void> {
+    for await (const prompt of inputs) {
+      yield* this.runSinglePrompt(prompt, overrides)
+    }
+  }
+
+  private buildQueryHandle(
+    initialInput: QueryInput | AsyncIterable<QueryInput>,
+    overrides?: Partial<AgentOptions>,
+    onFinished?: () => Promise<void>,
+  ): QueryHandle {
+    const runner = async function* (
+      this: Agent,
+      inputs: AsyncIterable<QueryInput>,
+    ): AsyncGenerator<SDKMessage> {
+      try {
+        yield* this.runPromptQueue(inputs, overrides)
+      } finally {
+        if (onFinished) {
+          await onFinished()
+        }
+      }
+    }.bind(this)
+
+    return new QueryController(
+      {
+        interrupt: () => this.interrupt(),
+        setPermissionMode: (mode) => this.setPermissionMode(mode),
+        setModel: (model) => this.setModel(model),
+        setMaxThinkingTokens: (tokens) => this.setMaxThinkingTokens(tokens),
+        setCwd: (cwd) => this.setCwd(cwd),
+        getInitializationResult: () => this.getInitializationResult(),
+        getContextUsage: () => this.getContextUsage(),
+        mcpServerStatus: () => this.mcpServerStatus(),
+        setMcpServers: (servers) => this.setMcpServers(servers),
+        reconnectMcpServer: (serverName) => this.reconnectMcpServer(serverName),
+        toggleMcpServer: (serverName, enabled) => this.toggleMcpServer(serverName, enabled),
+        reloadPlugins: () => this.reloadPlugins(),
+        rewindFiles: (userMessageId, dryRun) => this.rewindFiles(userMessageId, dryRun),
+        stopTask: (taskId) => this.stopTask(taskId),
+      },
+      runner,
+      initialInput,
+    )
+  }
+
+  query(
+    prompt: QueryInput | AsyncIterable<QueryInput>,
+    overrides?: Partial<AgentOptions>,
+  ): QueryHandle {
+    return this.buildQueryHandle(prompt, overrides)
   }
 
   async prompt(
     text: string,
     overrides?: Partial<AgentOptions>,
   ): Promise<QueryResult> {
-    const startTime = Date.now()
-    let resultText = ''
-    let usage = { input_tokens: 0, output_tokens: 0 }
-    let numTurns = 0
-    let sessionId = ''
-    let totalCostUsd = 0
+    const t0 = performance.now()
+    const collected = { text: '', turns: 0, tokens: { in: 0, out: 0 } }
 
-    for await (const event of this.query(text, overrides)) {
-      const msg = event as any
-
-      if (msg.type === 'system' && msg.subtype === 'init') {
-        sessionId = msg.session_id || ''
-      }
-
-      if (msg.type === 'assistant') {
-        const textBlocks = (msg.message?.content || [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-        resultText = textBlocks.join('')
-      }
-
-      if (msg.type === 'result') {
-        if (msg.usage) {
-          usage = {
-            input_tokens: msg.usage.input_tokens || 0,
-            output_tokens: msg.usage.output_tokens || 0,
-          }
+    for await (const ev of this.query(text, overrides)) {
+      switch (ev.type) {
+        case 'assistant': {
+          const fragments = (ev.message.content as any[])
+            .filter((c: any) => c.type === 'text')
+            .map((c: any) => c.text)
+          if (fragments.length) collected.text = fragments.join('')
+          break
         }
-        numTurns = msg.num_turns || 0
-        totalCostUsd = msg.total_cost_usd || 0
-        sessionId = msg.session_id || sessionId
+        case 'result':
+          collected.turns = ev.num_turns ?? 0
+          collected.tokens.in = ev.usage?.input_tokens ?? 0
+          collected.tokens.out = ev.usage?.output_tokens ?? 0
+          break
       }
     }
 
     return {
-      text: resultText,
-      usage,
-      num_turns: numTurns,
-      duration_ms: Date.now() - startTime,
-      messages: [...this.mutableMessages],
-      session_id: sessionId,
-      total_cost_usd: totalCostUsd,
+      text: collected.text,
+      usage: { input_tokens: collected.tokens.in, output_tokens: collected.tokens.out },
+      num_turns: collected.turns,
+      duration_ms: Math.round(performance.now() - t0),
+      messages: [...this.messageLog],
     }
   }
 
   getMessages(): Message[] {
-    return [...this.mutableMessages]
+    return [...this.messageLog]
   }
 
   clear(): void {
-    this.mutableMessages = []
-    this.readFileCache = createFileStateCacheWithSizeLimit(5000)
-    this._hooksRegistered = false
+    this.history = []
+    this.messageLog = []
+    this.sessionMessages = []
+    this.fileCheckpointState = {}
   }
 
-  private _activeAbortController?: AbortController
-
-  abort(): void {
-    this._activeAbortController?.abort()
+  async interrupt(): Promise<void> {
+    this.abortCtrl?.abort('interrupt')
   }
 
-  setModel(model?: string): void {
-    this.resolvedModel = model || this.options.model || 'claude-sonnet-4-6'
-    this.options.model = this.resolvedModel
+  async setModel(model?: string): Promise<void> {
+    if (model) {
+      this.cfg.model = model
+      this.modelId = model
+      this.refreshResolvedConfig()
+    }
   }
 
-  setPermissionMode(mode: PermissionMode): void {
-    this.options.permissionMode = mode
+  async setPermissionMode(mode: PermissionMode): Promise<void> {
+    this.cfg.permissionMode = mode
   }
 
-  setMaxThinkingTokens(tokens: number | null): void {
-    if (tokens === null || tokens === 0) {
-      this.options.thinking = { type: 'disabled' } as any
+  async setMaxThinkingTokens(maxThinkingTokens: number | null): Promise<void> {
+    if (maxThinkingTokens === null) {
+      this.cfg.thinking = { type: 'disabled' }
     } else {
-      this.options.thinking = { type: 'enabled', budgetTokens: tokens } as any
+      this.cfg.thinking = { type: 'enabled', budgetTokens: maxThinkingTokens }
     }
   }
 
-  getAppState(): AppState {
-    return this.appState
+  async setCwd(cwd: string): Promise<void> {
+    this.cfg.cwd = cwd
+    this.baseOptions.cwd = cwd
+    this.setupDone = this.setup()
+    await this.setupDone
   }
 
-  setAppState(fn: (prev: AppState) => AppState): void {
-    this.appState = fn(this.appState)
+  getSessionId(): string {
+    return this.sid
   }
 
-  getMcpStatus(): any[] {
-    return this.mcpClients.map((c: any) => ({
-      name: c.name || 'unknown',
-      status: c.status || 'unknown',
-    }))
+  getApiType(): ApiType {
+    return this.apiType
   }
 
-  async reconnectMcpServer(name: string): Promise<void> {
-    const client = this.mcpClients.find((c: any) => c.name === name)
-    if (client?.reconnect) await client.reconnect()
-  }
-
-  async toggleMcpServer(name: string, enabled: boolean): Promise<void> {
-    const client = this.mcpClients.find((c: any) => c.name === name)
-    if (client) {
-      if (enabled && client.reconnect) await client.reconnect()
-      else if (!enabled && client.disconnect) await client.disconnect()
+  async stopTask(taskId: string): Promise<void> {
+    const { getTask } = await import('./tools/task-tools.js')
+    const task = getTask(taskId)
+    if (task) {
+      task.status = 'cancelled'
     }
   }
 
-  async setMcpServers(servers: Record<string, any>): Promise<any> {
-    const added: string[] = []
-    const removed: string[] = []
-    const existingNames = new Set(this.mcpClients.map((c: any) => c.name))
-    const newNames = new Set(Object.keys(servers))
+  async getInitializationResult(): Promise<InitializationResult> {
+    await this.setupDone
 
-    for (const name of existingNames) {
-      if (!newNames.has(name)) {
-        const client = this.mcpClients.find((c: any) => c.name === name)
-        if (client?.disconnect) await client.disconnect()
-        removed.push(name)
+    const commands = [
+      { name: '/clear', description: 'Clear the current conversation context' },
+      { name: '/compact', description: 'Compact the current conversation history' },
+      { name: '/resume', description: 'Resume a prior session' },
+      { name: '/mcp', description: 'Inspect MCP server status' },
+      { name: '/reload-plugins', description: 'Reload plugins from disk' },
+      ...getUserInvocableSkills().map((skill) => ({
+        name: `/${skill.name}`,
+        description: skill.description,
+      })),
+    ]
+
+    return {
+      commands,
+      agents: Object.entries({
+        ...this.getPluginAgents(),
+        ...(this.cfg.agents || {}),
+      }).map(([name, agent]) => ({
+        name,
+        description: agent.description,
+      })),
+      output_style: 'text',
+      available_output_styles: ['text', 'json'],
+      models: getDefaultModels(),
+      account: {
+        tokenSource: this.apiCredentials.key ? 'configured' : 'missing',
+        apiKeySource: this.apiCredentials.key ? 'configured' : 'missing',
+      },
+    }
+  }
+
+  async getContextUsage(): Promise<ContextUsageResult> {
+    await this.setupDone
+    if (this.currentEngine) {
+      return this.currentEngine.getContextUsage()
+    }
+    if (this.lastContextUsage) {
+      return this.lastContextUsage
+    }
+    const init = await this.getInitializationResult()
+    return {
+      categories: [
+        { name: 'messages', tokens: 0, color: 'blue' },
+        { name: 'system', tokens: 0, color: 'green' },
+        { name: 'tools', tokens: 0, color: 'orange' },
+      ],
+      totalTokens: 0,
+      maxTokens: getContextWindowSize(this.modelId),
+      rawMaxTokens: getContextWindowSize(this.modelId),
+      percentage: 0,
+      gridRows: [],
+      model: this.modelId,
+      memoryFiles: [],
+      mcpTools: [],
+      deferredBuiltinTools: [],
+      systemTools: [],
+      systemPromptSections: [],
+      agents: init.agents.map((agent) => ({
+        agentType: agent.name,
+        source: 'init',
+        tokens: Math.ceil(agent.description.length / 4),
+      })),
+      slashCommands: {
+        totalCommands: init.commands.length,
+        includedCommands: init.commands.length,
+        tokens: init.commands.reduce((sum, command) => sum + Math.ceil((command.name.length + command.description.length) / 4), 0),
+      },
+      skills: {
+        totalSkills: getUserInvocableSkills().length,
+        includedSkills: getUserInvocableSkills().length,
+        tokens: getUserInvocableSkills().reduce((sum, skill) => sum + Math.ceil((skill.name.length + skill.description.length) / 4), 0),
+        skillFrontmatter: getUserInvocableSkills().map((skill) => ({
+          name: skill.name,
+          source: 'runtime',
+          tokens: Math.ceil((skill.name.length + skill.description.length) / 4),
+        })),
+      },
+      messageBreakdown: {
+        toolCallTokens: 0,
+        toolResultTokens: 0,
+        attachmentTokens: 0,
+        assistantMessageTokens: 0,
+        userMessageTokens: 0,
+        toolCallsByType: [],
+        attachmentsByType: [],
+      },
+      isAutoCompactEnabled: true,
+      apiUsage: null,
+    }
+  }
+
+  private collectMcpServerStatuses(): MCPServerStatus[] {
+    const configs = this.getConfiguredMcpServers()
+    return Object.entries(configs).map(([name, config]) => {
+      const live = this.mcpLinks.find((conn) => conn.name === name)
+      return {
+        name,
+        status: this.disabledMcpServers.has(name)
+          ? 'disconnected'
+          : live?.status || 'disconnected',
+        enabled: !this.disabledMcpServers.has(name),
+        tools: live?.tools.map((tool) => tool.name) || (isSdkServerConfig(config)
+          ? config.tools.map((tool) => tool.name)
+          : []),
+        error: live?.error,
+      }
+    })
+  }
+
+  async mcpServerStatus(): Promise<MCPServerStatus[]> {
+    await this.setupDone
+    return this.collectMcpServerStatuses()
+  }
+
+  async setMcpServers(
+    servers: Record<string, McpServerConfig | any>,
+  ): Promise<{ added: string[]; removed: string[]; errors: Record<string, string> }> {
+    await this.setupDone
+
+    const previous = new Set(Object.keys(this.cfg.mcpServers || {}))
+    const next = new Set(Object.keys(servers))
+    const added = [...next].filter((name) => !previous.has(name))
+    const removed = [...previous].filter((name) => !next.has(name))
+    const errors: Record<string, string> = {}
+
+    this.cfg.mcpServers = { ...servers }
+    for (const name of removed) {
+      this.disabledMcpServers.delete(name)
+    }
+
+    await this.syncMcpConnections()
+    this.rebuildToolPool()
+
+    for (const status of this.collectMcpServerStatuses()) {
+      if (status.status === 'error' && status.error) {
+        errors[status.name] = status.error
       }
     }
-    this.mcpClients = this.mcpClients.filter((c: any) => newNames.has(c.name))
 
-    for (const [name, config] of Object.entries(servers)) {
-      if (!existingNames.has(name)) {
-        try {
-          const { connectToServer, fetchToolsForClient } = await import('./services/mcp/client.js')
-          const connection = await connectToServer(name, { ...config, scope: 'dynamic' as const } as any)
-          this.mcpClients.push(connection)
-          if (connection.status === 'connected' && connection.client) {
-            const mcpTools = await fetchToolsForClient(connection)
-            if (mcpTools?.length) this.tools = [...this.tools, ...mcpTools]
-          }
-          added.push(name)
-        } catch {
-          // skip failed connections
-        }
+    return { added, removed, errors }
+  }
+
+  async reconnectMcpServer(serverName: string): Promise<MCPServerStatus | null> {
+    await this.setupDone
+    this.disabledMcpServers.delete(serverName)
+    await this.syncMcpConnections()
+    this.rebuildToolPool()
+    return this.collectMcpServerStatuses().find((status) => status.name === serverName) || null
+  }
+
+  async toggleMcpServer(serverName: string, enabled: boolean): Promise<MCPServerStatus | null> {
+    await this.setupDone
+    if (enabled) {
+      this.disabledMcpServers.delete(serverName)
+    } else {
+      this.disabledMcpServers.add(serverName)
+    }
+    await this.syncMcpConnections()
+    this.rebuildToolPool()
+    return this.collectMcpServerStatuses().find((status) => status.name === serverName) || null
+  }
+
+  async reloadPlugins(): Promise<ReloadPluginsResult> {
+    await this.setupDone
+
+    this.loadedPlugins = await loadPlugins(this.cfg.cwd || process.cwd(), this.cfg.plugins)
+    this.registerPluginSkills()
+    this.resetHookRegistry()
+    await this.syncMcpConnections()
+    this.rebuildToolPool()
+
+    const mergedAgents = {
+      ...this.getPluginAgents(),
+      ...(this.cfg.agents || {}),
+    }
+    if (Object.keys(mergedAgents).length > 0) {
+      registerAgents(mergedAgents)
+    }
+
+    return {
+      commands: (await this.getInitializationResult()).commands,
+      agents: Object.entries(mergedAgents).map(([name, agent]) => ({
+        name,
+        description: agent.description,
+      })),
+      plugins: this.loadedPlugins.map((plugin) => ({
+        name: plugin.name,
+        path: plugin.path,
+        source: plugin.source,
+      })),
+      mcpServers: this.collectMcpServerStatuses(),
+      error_count: this.collectMcpServerStatuses().filter((status) => status.status === 'error').length,
+    }
+  }
+
+  async rewindFiles(
+    userMessageId: string,
+    dryRun = false,
+  ): Promise<RewindFilesResult> {
+    await this.setupDone
+    const checkpoint = this.fileCheckpointState[userMessageId]
+    const result = await rewindCheckpoint(checkpoint, dryRun)
+    if (!dryRun && result.canRewind) {
+      await saveSession(this.sid, this.history, {
+        cwd: this.cfg.cwd || process.cwd(),
+        model: this.modelId,
+        summary: extractSummary(this.messageLog),
+        sessionMessages: this.sessionMessages,
+        checkpoints: this.fileCheckpointState,
+      })
+    }
+    return result
+  }
+
+  async close(): Promise<void> {
+    if (this.cfg.persistSession !== false && this.history.length > 0) {
+      try {
+        await saveSession(this.sid, this.history, {
+          cwd: this.cfg.cwd || process.cwd(),
+          model: this.modelId,
+          summary: extractSummary(this.messageLog),
+          sessionMessages: this.sessionMessages,
+          checkpoints: this.fileCheckpointState,
+        })
+      } catch {
+        // Session persistence is best-effort.
       }
     }
 
-    return { added, removed, errors: [] }
+    await closeAllConnections(this.mcpLinks)
+    this.mcpLinks = []
   }
 }
 
-// ============================================================================
-// Factory function
-// ============================================================================
-
-/**
- * Create a new Agent instance.
- *
- * @example
- * ```typescript
- * const agent = createAgent({
- *   model: 'claude-sonnet-4-6',
- *   tools: getAllBaseTools(),
- * })
- *
- * for await (const event of agent.query('Analyze this project')) {
- *   // handle events
- * }
- * ```
- */
 export function createAgent(options: AgentOptions = {}): Agent {
   return new Agent(options)
 }
 
-// ============================================================================
-// Top-level query() function (compatible with @anthropic-ai/claude-agent-sdk)
-// ============================================================================
-
-/**
- * Run a one-shot agent query. Compatible with the official SDK's query() API.
- *
- * @example
- * ```typescript
- * import { query } from '@shipany/open-agent-sdk'
- *
- * for await (const message of query({
- *   prompt: 'Find and fix the bug in auth.py',
- *   options: { allowedTools: ['Read', 'Edit', 'Bash'] }
- * })) {
- *   if (message.type === 'assistant') {
- *     for (const block of message.message.content) {
- *       if ('text' in block) console.log(block.text)
- *     }
- *   }
- * }
- * ```
- */
-export async function* query(params: {
-  prompt: string
+export function query(params: {
+  prompt: QueryInput | AsyncIterable<QueryInput>
   options?: AgentOptions
-}): AsyncGenerator<SDKMessage, void> {
-  const agent = new Agent(params.options ?? {})
-  yield* agent.query(params.prompt)
+}): QueryHandle {
+  const ephemeral = createAgent(params.options)
+  return (ephemeral as any).buildQueryHandle(
+    params.prompt,
+    undefined,
+    async () => {
+      await ephemeral.close()
+    },
+  ) as QueryHandle
 }
